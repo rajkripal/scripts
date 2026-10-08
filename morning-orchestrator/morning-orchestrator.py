@@ -23,7 +23,8 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 # --- Config ---
 
@@ -149,7 +150,8 @@ def collect_emails() -> dict:
     all_emails = []
     important = []
     noise_count = 0
-    
+    scan_failures = []  # accounts whose search failed — scan is incomplete, NOT "inbox clear"
+
     accounts = get_accounts()
     important_senders = get_important_senders()
 
@@ -161,11 +163,13 @@ def collect_emails() -> dict:
         )
         if result.returncode != 0:
             print(f"   ⚠️  {account}: search failed", file=sys.stderr)
+            scan_failures.append({"account": account, "stage": "search", "error": result.stderr[:300]})
             continue
 
         try:
             data = json.loads(result.stdout)
         except json.JSONDecodeError:
+            scan_failures.append({"account": account, "stage": "parse", "error": "invalid JSON from gog search"})
             continue
 
         threads = data.get("threads", [])
@@ -200,7 +204,29 @@ def collect_emails() -> dict:
         "important": important,
         "important_count": len(important),
         "noise_count": noise_count,
+        "scan_failed": bool(scan_failures),
+        "scan_failures": scan_failures,
     }
+
+
+def _to_pacific(dt_str: str, tz=None) -> str:
+    """Convert an ISO datetime string to Pacific Time display format."""
+    if not dt_str:
+        return dt_str
+    if tz is None:
+        tz = ZoneInfo("America/Los_Angeles")
+    try:
+        # All-day events are just dates — return as-is
+        if len(dt_str) <= 10:
+            return dt_str
+        dt_str_clean = dt_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(dt_str_clean)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt_pacific = dt.astimezone(tz)
+        return dt_pacific.strftime("%Y-%m-%dT%H:%M:%S %Z")
+    except (ValueError, TypeError):
+        return dt_str
 
 
 def collect_calendar() -> dict:
@@ -229,16 +255,21 @@ def collect_calendar() -> dict:
     today_str = datetime.now().strftime("%Y-%m-%d")
     tomorrow_str = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    today_events = [e for e in events if today_str in e.get("start", "")]
-    tomorrow_events = [e for e in events if tomorrow_str in e.get("start", "")]
+    # Convert start times to Pacific BEFORE comparing dates — an event with a
+    # non-Pacific offset (e.g. "-04:00") can have a different calendar date in
+    # its raw start string than its actual Pacific-local date, so matching the
+    # raw string silently misses it.
+    pacific = ZoneInfo("America/Los_Angeles")
+    today_events = [e for e in events if today_str in _to_pacific(e.get("start", ""), pacific)]
+    tomorrow_events = [e for e in events if tomorrow_str in _to_pacific(e.get("start", ""), pacific)]
 
-    # Simplify event data
+    # Simplify event data, converting times to Pacific
     simplified = []
     for e in events:
         simplified.append({
             "summary": e.get("summary", "No title"),
-            "start": e.get("start", ""),
-            "end": e.get("end", ""),
+            "start": _to_pacific(e.get("start", ""), pacific),
+            "end": _to_pacific(e.get("end", ""), pacific),
             "status": e.get("status", ""),
         })
 
@@ -371,6 +402,12 @@ def collect_todos() -> dict:
 def is_actionable(data: dict) -> tuple[bool, list[str]]:
     """Determine if any data warrants waking an agent. Returns (bool, reasons)."""
     reasons = []
+
+    # Email scan failures — surface explicitly so the briefing doesn't imply
+    # a clean inbox when the scan actually failed partway through.
+    if data["emails"].get("scan_failed"):
+        failed_accounts = ", ".join(f.get("account", "?") for f in data["emails"].get("scan_failures", []))
+        reasons.append(f"⚠️ email scan failed for: {failed_accounts}")
 
     # Important emails
     if data["emails"]["important_count"] > 0:
